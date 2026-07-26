@@ -5,19 +5,28 @@ from ..components.status_row import status_row
 
 VAPID_PUBLIC = os.getenv("VAPID_PUBLIC_KEY")
 
-# Coordenadas del sensor magnético sobre el plano (ajusta)
+# Coordenadas del sensor magnético sobre el plano
 SENSOR_POS = {
-    "top": "81%",    # Cambia según tu imagen
-    "left": "88%",   # Cambia según tu imagen
+    "top": "81%",
+    "left": "88%",
 }
 CAM_1_POS = {
-    "top": "83%",    # Cambia según tu imagen
-    "left": "5%",   # Cambia según tu imagen
+    "top": "83%",
+    "left": "5%",
 }
 
+# Coordenadas para los tamper en la esquina inferior izquierda
+TAMPER1_POS = {
+    "top": "85%",
+    "left": "24%",
+}
+TAMPER2_POS = {
+    "top": "92%",
+    "left": "15%",
+}
 
 def logs_popover():
-    """Popover que muestra el historial de logs desde logs.json con formato de texto plano."""
+    """Popover que muestra el historial de logs con el formato solicitado."""
     return rx.popover.root(
         rx.popover.trigger(
             rx.button(
@@ -31,40 +40,40 @@ def logs_popover():
         ),
         rx.popover.content(
             rx.vstack(
-                # Cabecera con título y botones de refresco + cerrar
                 rx.hstack(
                     rx.icon("clipboard-list", size=16, color="#94a3b8"),
-                    rx.heading("REGISTROS", size="3", letter_spacing="0.05em"),
+                    # Título clickeable que ejecuta refresh_logs
+                    rx.button(
+                        "REGISTROS",
+                        variant="ghost",
+                        size="3",
+                        letter_spacing="0.05em",
+                        font_weight="bold",
+                        padding="0",
+                        on_click=State.refresh_logs,
+                        _active={"transform": "scale(1.1)"},
+                        _hover={"color": "#e2e8f0"},
+                    ),
                     rx.spacer(),
-                    rx.hstack(
-                        rx.button(
-                            rx.icon("refresh-cw", size=14),
-                            variant="ghost",
-                            size="1",
-                            on_click=State.refresh_logs,
-                            title="Refrescar logs",
-                        ),
-                        rx.button(
-                            rx.icon("x", size=14),
-                            variant="ghost",
-                            size="1",
-                            on_click=rx.call_script("document.querySelector('[data-state=open]')?.click()"),
-                            title="Cerrar",
-                        ),
-                        spacing="1",
+                    rx.button(
+                        rx.icon("x", size=14),
+                        variant="ghost",
+                        size="1",
+                        on_click=rx.call_script("document.querySelector('[data-state=open]')?.click()"),
+                        title="Cerrar",
                     ),
                     width="100%",
+                    align="center",
                 ),
                 rx.divider(opacity="0.1"),
-                # Contenido de los logs
                 rx.box(
                     rx.foreach(
                         State.logs_recientes,
                         lambda log: rx.hstack(
-                            # Icono según acción (anidado correctamente)
+                            # Icono según el tipo de acción
                             rx.cond(
                                 log["accion"] == "ALARMA_DISPARADA",
-                                rx.icon("triangle-alert", size=16, color="#ef4444"),  # ⚠️ solo para "Notificación enviada"
+                                rx.icon("triangle-alert", size=16, color="#ef4444"),
                                 rx.cond(
                                     log["accion"] == "ARMADO",
                                     rx.icon("shield-check", size=16, color="#22c55e"),
@@ -73,14 +82,26 @@ def logs_popover():
                                         rx.icon("shield-off", size=16, color="#64748b"),
                                         rx.cond(
                                             log["accion"] == "PUERTA_ABIERTA",
-                                            rx.icon("door-open", size=16, color="#f97316"),      # 🚪
+                                            rx.icon("door-open", size=16, color="#f97316"),
                                             rx.cond(
-                                                log["accion"] == "PUERTA_ABIERTA_ARMADA",
-                                                rx.icon("door-open", size=16, color="#f97316"),  # 🚪 ¡mismo icono!
+                                                log["accion"] == "PUERTA_CERRADA",
+                                                rx.icon("door-closed", size=16, color="#22c55e"),
                                                 rx.cond(
-                                                    log["accion"] == "PUERTA_CERRADA",
-                                                    rx.icon("door-closed", size=16, color="#22c55e"),
-                                                    rx.icon("file-text", size=16, color="#94a3b8")
+                                                    log["accion"] == "TAMPER1_ABIERTO",
+                                                    rx.icon("lock", size=16, color="#ef4444"),
+                                                    rx.cond(
+                                                        log["accion"] == "TAMPER1_CERRADO",
+                                                        rx.icon("lock", size=16, color="#22c55e"),
+                                                        rx.cond(
+                                                            log["accion"] == "TAMPER2_ABIERTO",
+                                                            rx.icon("lock", size=16, color="#ef4444"),
+                                                            rx.cond(
+                                                                log["accion"] == "TAMPER2_CERRADO",
+                                                                rx.icon("lock", size=16, color="#22c55e"),
+                                                                rx.icon("file-text", size=16, color="#94a3b8")
+                                                            )
+                                                        )
+                                                    )
                                                 )
                                             )
                                         )
@@ -88,12 +109,40 @@ def logs_popover():
                                 )
                             ),
                             rx.text(log["timestamp"], size="1", color="#94a3b8", width="150px", font_family="monospace"),
+                            rx.text(log["usuario"], size="1", color="#38bdf8", width="100px"),
+                            # Detalle con POPOVER para ARMADO con abiertos
                             rx.cond(
-                                log["usuario"] != "sistema",
-                                rx.text(log["usuario"], size="1", color="#38bdf8", width="100px"),
-                                rx.text("", width="100px"),
+                                log["accion"] == "ARMADO",
+                                rx.cond(
+                                    log["detalle"].to(str) != "Armado (sin abiertos)",
+                                    rx.popover.root(
+                                        rx.popover.trigger(
+                                            rx.icon("info", size=16, color="#f97316", cursor="pointer")
+                                        ),
+                                        rx.popover.content(
+                                            rx.vstack(
+                                                rx.text("Elementos abiertos al armar:", weight="bold", color="#e2e8f0"),
+                                                rx.text(
+                                                    log["detalle"].to(str).replace("Armado con abiertos: ", ""),
+                                                    color="#94a3b8"
+                                                ),
+                                                spacing="2",
+                                            ),
+                                            background="#1e293b",
+                                            border="1px solid #475569",
+                                            padding="12px",
+                                            border_radius="8px",
+                                        ),
+                                    ),
+
+                                    
+                                ),
+                                rx.cond(
+                                    log["accion"] == "DESARMADO",
+                                    rx.icon("shield-off", size=16, color="#64748b"),
+                                    rx.text(log["detalle"], size="1", color="#e2e8f0", flex="1"),
+                                ),
                             ),
-                            rx.text(log["detalle"], size="1", color="#e2e8f0", flex="1"),
                             spacing="2",
                             width="100%",
                             align="center",
@@ -116,18 +165,19 @@ def logs_popover():
             padding="12px",
         ),
     )
-# ========== ALARMA CONTROL VIEW (con popover y plano) ==========
+
 def alarma_control_view():
     return rx.card(
         rx.vstack(
             rx.hstack(
-                # Popover del escudo (plano interactivo)
+                # Popover del escudo (plano interactivo) - ICONO ROJO O GRIS
                 rx.popover.root(
                     rx.popover.trigger(
                         rx.button(
                             rx.icon(
                                 rx.cond(State.sistema_armado, "shield-check", "shield-off"),
-                                color=rx.cond(State.sistema_armado, "#ff4d4d", "#64748b"),
+                                # ROJO cuando armado, GRIS cuando desarmado
+                                color=rx.cond(State.sistema_armado, "#ef4444", "#64748b"),
                                 size=22,
                             ),
                             variant="ghost",
@@ -141,7 +191,6 @@ def alarma_control_view():
                         rx.vstack(
                             rx.text("Plano de Planta", size="1", weight="bold", color="#94a3b8"),
                             rx.divider(opacity="0.1"),
-                            # Contenedor del plano con tamaño controlado
                             rx.box(
                                 rx.image(
                                     src="/room.png",
@@ -151,11 +200,10 @@ def alarma_control_view():
                                     border_radius="6px",
                                     opacity="0.9",
                                 ),
-                                # Sensor magnético (candado) con verde para cerrado
+                                # Sensor puerta principal
                                 rx.box(
                                     rx.cond(
                                         State.puerta_abierta,
-                                        # Estado ABIERTO: rojo parpadeante
                                         rx.box(
                                             rx.icon("door-open", size=14, color="#ef4444"),
                                             background="rgba(239, 68, 68, 0.25)",
@@ -165,27 +213,26 @@ def alarma_control_view():
                                             box_shadow="0 0 16px #ef4444",
                                             animation="pulse 1.5s infinite alternate",
                                         ),
-                                        # Estado CERRADO: VERDE (sutil pero visible)
                                         rx.box(
-                                            rx.icon("lock", size=12, color="#22c55e"),      # icono verde
-                                            background="rgba(34, 197, 94, 0.2)",            # fondo verde suave
-                                            border="2px solid #22c55e",                     # borde verde
+                                            rx.icon("lock", size=12, color="#22c55e"),
+                                            background="rgba(34, 197, 94, 0.2)",
+                                            border="2px solid #22c55e",
                                             border_radius="50%",
                                             padding="4px",
-                                            box_shadow="0 0 8px #22c55e",                   # sombra verde
+                                            box_shadow="0 0 8px #22c55e",
                                         ),
                                     ),
                                     position="absolute",
-                                    top=SENSOR_POS["top"],      # ⬅️ aquí controlas la posición vertical
-                                    left=SENSOR_POS["left"],    # ⬅️ aquí controlas la posición horizontal
+                                    top=SENSOR_POS["top"],
+                                    left=SENSOR_POS["left"],
                                     transform="translate(-50%, -50%)",
                                     cursor="help",
                                     title=rx.cond(State.puerta_abierta, "Puerta Principal: ABIERTA", "Puerta Principal: Cerrada"),
                                     z_index="10",
                                 ),
-                                # Segundo sensor: Cámara fija (CCTV)
+                                # Cámara fija
                                 rx.box(
-                                    rx.icon("cctv", size=14, color="#38bdf8"),  # icono de cámara en azul
+                                    rx.icon("cctv", size=14, color="#38bdf8"),
                                     background="rgba(56, 189, 248, 0.2)",
                                     border="2px solid #38bdf8",
                                     border_radius="50%",
@@ -198,20 +245,123 @@ def alarma_control_view():
                                     cursor="pointer",
                                     title="Cámara Fija Principal",
                                     z_index="10",
-                                    on_click=State.toggle_fija_stream,  # <-- al hacer clic, activa/desactiva la cámara
+                                    on_click=State.toggle_fija_stream,
+                                ),
+                                # Tamper 1 - RECTÁNGULO DE BORDE (3px alto, 6px ancho) SIN RELLENO
+                                rx.popover.root(
+                                    rx.popover.trigger(
+                                        rx.box(
+                                            # El rectángulo: solo borde, sin relleno
+                                            width="29px",
+                                            height="16px",
+                                            border=rx.cond(
+                                                State.tamper1_abierto,
+                                                "1px solid #ef4444",   # ROJO cuando abierto (1px para no colapsar los 3px de alto)
+                                                "1px solid #3b82f6"    # AZUL cuando cerrado
+                                            ),
+                                            border_radius="1px",
+                                            background="transparent",
+                                            box_sizing="border-box",   # Garantiza que el borde no aumente las dimensiones finales
+                                            cursor="pointer",
+                                            title=rx.cond(
+                                                State.tamper1_abierto,
+                                                f"Tamper1: ABIERTO (estado: {rx.cond(State.tamper1_armado, 'ARMADO', 'DESARMADO')})",
+                                                f"Tamper1: CERRADO (estado: {rx.cond(State.tamper1_armado, 'ARMADO', 'DESARMADO')})"
+                                            ),
+                                        ),
+                                        position="absolute",
+                                        top=TAMPER1_POS["top"],
+                                        left=TAMPER1_POS["left"],
+                                        transform="translate(-50%, -50%)",
+                                        z_index="10",
+                                    ),
+                                    rx.popover.content(
+                                        rx.vstack(
+                                            rx.text("Control Tamper1", size="2", weight="bold", color="#e2e8f0"),
+                                            rx.divider(opacity="0.1"),
+                                            rx.hstack(
+                                                rx.button(
+                                                    "ARMAR",
+                                                    on_click=State.toggle_tamper1_armado(True),
+                                                    color_scheme="red",
+                                                    variant=rx.cond(State.tamper1_armado, "solid", "surface"),
+                                                    size="2",
+                                                    width="100px",
+                                                ),
+                                                rx.button(
+                                                    "DESARMAR",
+                                                    on_click=State.toggle_tamper1_armado(False),
+                                                    color_scheme="gray",
+                                                    variant=rx.cond(~State.tamper1_armado, "solid", "surface"),
+                                                    size="2",
+                                                    width="100px",
+                                                ),
+                                                spacing="2",
+                                                width="100%",
+                                                justify="center",
+                                            ),
+                                            rx.cond(
+                                                State.tamper1_armado,
+                                                rx.text("🔴 ARMADO", size="1", color="#ef4444"),
+                                                rx.text("🔓 DESARMADO", size="1", color="#94a3b8"),
+                                            ),
+                                            spacing="2",
+                                            width="200px",
+                                            padding="8px",
+                                        ),
+                                        background="#1e293b",
+                                        border="1px solid #475569",
+                                        border_radius="8px",
+                                        padding="12px",
+                                    ),
+                                    position="absolute",
+                                    top=TAMPER1_POS["top"],
+                                    left=TAMPER1_POS["left"],
+                                    transform="translate(-50%, -50%)",
+                                    z_index="10",
+                                ),
+                                # Tamper 2
+                                rx.box(
+                                    rx.cond(
+                                        State.tamper2_abierto,
+                                        rx.icon("lock-open", size=12, color="#ef4444"),
+                                        rx.icon("lock", size=12, color="#22c55e"),
+                                    ),
+                                    background=rx.cond(
+                                        State.tamper2_abierto,
+                                        "rgba(239, 68, 68, 0.25)",
+                                        "rgba(34, 197, 94, 0.2)",
+                                    ),
+                                    border=rx.cond(
+                                        State.tamper2_abierto,
+                                        "2px solid #ef4444",
+                                        "2px solid #22c55e",
+                                    ),
+                                    border_radius="50%",
+                                    padding="4px",
+                                    box_shadow=rx.cond(
+                                        State.tamper2_abierto,
+                                        "0 0 12px #ef4444",
+                                        "0 0 8px #22c55e",
+                                    ),
+                                    position="absolute",
+                                    top=TAMPER2_POS["top"],
+                                    left=TAMPER2_POS["left"],
+                                    transform="translate(-50%, -50%)",
+                                    cursor="help",
+                                    title=rx.cond(State.tamper2_abierto, "Tamper2: ABIERTO", "Tamper2: Cerrado"),
+                                    z_index="10",
                                 ),
                                 position="relative",
                                 width="100%",
-                                # 🔥 AJUSTE CLAVE: altura máxima para que no desborde
-                                max_height="55vh",    # 55% de la altura de la ventana
+                                max_height="55vh",
                                 overflow="hidden",
                                 background="#0f172a",
                                 border_radius="6px",
                                 border="1px solid rgba(255, 255, 255, 0.05)",
                             ),
                             spacing="2",
-                            # 🔥 AJUSTE CLAVE: ancho máximo para que no desborde
-                            width="min(340px, 92vw)",  # Mínimo entre 340px y 92% del ancho de la ventana
+                            width="min(340px, 92vw)",
                         ),
                         background="#111827",
                         border="1px solid rgba(255, 255, 255, 0.1)",
@@ -227,8 +377,6 @@ def alarma_control_view():
                     color_scheme=rx.cond(State.puerta_abierta, "red", "green"),
                     variant="surface"
                 ),
-
-                # Botón de alerta (script completo)
                 rx.button(
                     rx.icon("triangle-alert", size=18, color="#f97316"),
                     on_click=rx.call_script(
@@ -261,8 +409,6 @@ def alarma_control_view():
                     title="Enviar alerta a todos",
                     aria_label="Enviar alerta push a todos los dispositivos",
                 ),
-
-                # Botón de suscripción push (script completo)
                 rx.button(
                     rx.icon("bell", size=18),
                     on_click=rx.call_script(
@@ -327,6 +473,7 @@ def alarma_control_view():
                 ),
                 width="100%",
                 align="center",
+                spacing="2",
             ),
             rx.divider(opacity="0.1"),
             rx.hstack(
@@ -347,11 +494,11 @@ def alarma_control_view():
         width="100%",
         background="rgba(255, 255, 255, 0.03)",
         backdrop_filter="blur(10px)",
-        border=rx.cond(State.sistema_armado, "1px solid rgba(255, 77, 77, 0.3)", "1px solid rgba(255, 255, 255, 0.1)"),
+        # BORDE ROJO cuando armado, gris cuando desarmado
+        border=rx.cond(State.sistema_armado, "1px solid rgba(239, 68, 68, 0.3)", "1px solid rgba(255, 255, 255, 0.1)"),
         padding="4",
     )
 
-# ========== CCTV VIEW ==========
 def cctv_view():
     return rx.card(
         rx.vstack(
@@ -387,8 +534,6 @@ def cctv_view():
         padding="4",
     )
 
-
-# ========== DEVICE LIST VIEW (la que importas en index) ==========
 def device_list_view():
     return rx.vstack(
         alarma_control_view(),

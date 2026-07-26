@@ -17,6 +17,7 @@ app = rx.App(
     style=STYLE,   # <--- Aquí inyectamos la animación
     head_components=[
         rx.el.link(rel="manifest", href="/manifest.json"),
+
     ],
     admin_dash=False,
 )

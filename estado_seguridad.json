@@ -1,5 +1,11 @@
 {
   "sistema_armado": false,
   "notificacion_enviada": false,
-  "puerta_abierta": false
+  "puerta_abierta": true,
+  "tamper_1_activado": false,
+  "tamper_2_activado": false,
+  "tamper1_abierto": true,
+  "tamper2_abierto": true,
+  "tamper1_armado": false,
+  "notificacion_tamper1_enviada": false
 }

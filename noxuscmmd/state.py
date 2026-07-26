@@ -1,3 +1,4 @@
+import fcntl
 import os
 import asyncio
 import subprocess
@@ -7,15 +8,15 @@ import reflex as rx
 import time
 from pathlib import Path
 from dotenv import load_dotenv
-import fcntl  # Para bloqueo de archivos en Unix
 
 from .core.connectivity import NetUtils
 from .core.ssh_manager import SSHManager
 from .core.sensors import Sensors
 from .core.shared_state import (
-    get_sistema_armado, toggle_sistema_armado,
+    get_sistema_armado, get_tamper1_armado, set_tamper1_abierto, set_tamper1_armado, toggle_sistema_armado,
     get_notificacion_enviada, set_notificacion_enviada,
-    get_puerta_abierta,
+    get_notificacion_tamper1_enviada, set_notificacion_tamper1_enviada,  # <--- IMPORTADAS
+    get_puerta_abierta, get_tamper1_abierto, get_tamper2_abierto,
 )
 from .core import device_actions
 from .core.mqtt_client import MQTTClient
@@ -27,7 +28,6 @@ VAPID_PUBLIC  = os.getenv("VAPID_PUBLIC_KEY")
 VAPID_EMAIL   = os.getenv("VAPID_EMAIL", "mailto:admin@noxuscmmd.uk")
 
 _SSH_STARTED = False
-_SYNC_LOOP_STARTED = False   # <--- NUEVA BANDERA GLOBAL
 
 # ---------- GESTOR MQTT GLOBAL ----------
 _mqtt_client_instance = None
@@ -40,6 +40,7 @@ def get_mqtt_client(broker, port, topic, state_instance):
     return _mqtt_client_instance
 
 class State(rx.State):
+
     # ── Dispositivos ──────────────────────────────────────────────────────
     raspberry_online: bool = False
     iphone_online:    bool = False
@@ -62,22 +63,26 @@ class State(rx.State):
     # ── Seguridad ─────────────────────────────────────────────────────────
     sistema_armado: bool = False
     puerta_abierta: bool = False
+    tamper1_abierto: bool = False
+    tamper2_abierto: bool = False
+    tamper1_armado: bool = False
+    ultimos_abiertos_armado: list[str] = []
 
     # ── Control comandos personalizados ───────────────────────────────────
     custom_command: dict[str, str] = {}
     custom_output:  dict[str, str] = {}
-    current_user: str = ""      # Nombre del usuario de la sesión actual
-    current_session: str = ""   # Endpoint o identificador de la suscripción
+    current_user: str = ""
+    current_session: str = ""
     _sync_running: bool = False
 
     # ── Cámaras ──────────────────────────────────────────────────────────
-    cam_mode: str = "pc"  # "pc" o "mobile"
+    cam_mode: str = "pc"
     show_fija_stream: bool = False
     show_ptz_stream: bool = False
 
     # ── Logs ─────────────────────────────────────────────────────────────
     _logs_update_counter: int = 0
-    _ultimo_evento_puerta: str = ""   # "PUERTA_ABIERTA", "PUERTA_ABIERTA_ARMADA" o "PUERTA_CERRADA"
+    _ultimo_evento_puerta: str = ""
     last_puerta_log_time: float = 0.0
 
     # ════════════════════════════════════════════════════════════════════
@@ -85,7 +90,6 @@ class State(rx.State):
     # ════════════════════════════════════════════════════════════════════
 
     def _ultimo_log_puerta(self) -> str:
-        """Devuelve la acción del último log que sea PUERTA_ABIERTA, PUERTA_ABIERTA_ARMADA o PUERTA_CERRADA, o cadena vacía."""
         archivo = "logs.json"
         if not os.path.exists(archivo):
             return ""
@@ -104,12 +108,10 @@ class State(rx.State):
         return ""
 
     def refresh_logs(self):
-        """Forzar la actualización de la vista de logs."""
         self._logs_update_counter += 1
 
     @rx.var
     def logs_recientes(self) -> list[dict]:
-        """Devuelve la lista de logs (ordenados del más reciente al más antiguo)."""
         _ = self._logs_update_counter
         archivo = "logs.json"
         if not os.path.exists(archivo):
@@ -124,17 +126,11 @@ class State(rx.State):
         except:
             return []
 
-    def registrar_log(self, accion: str, detalle: str = "", usar_usuario: bool = True):
-        """
-        Escribe una entrada en logs.json con timestamp y usuario actual.
-        - Si el último evento coincide exactamente con la acción y el detalle, no escribe (evita duplicados).
-        - Usa bloqueo de archivo para escritura atómica entre procesos.
-        """
+    def registrar_log(self, accion: str, detalle: str = "", usar_usuario: bool = True, usuario_override: str = None):
         archivo = "logs.json"
-        # 1. Leer el último evento con bloqueo
         try:
             with open(archivo, "a+" if os.path.exists(archivo) else "w+") as f:
-                fcntl.flock(f.fileno(), fcntl.LOCK_EX)  # Bloqueo exclusivo
+                fcntl.flock(f.fileno(), fcntl.LOCK_EX)
                 f.seek(0)
                 content = f.read().strip()
                 logs = []
@@ -143,14 +139,14 @@ class State(rx.State):
                         logs = json.loads(content)
                     except:
                         logs = []
-                # Comprobar último evento
                 if logs:
                     ultimo = logs[-1]
-                    # Si la acción y detalle son idénticos, no escribir
                     if ultimo.get("accion") == accion and ultimo.get("detalle") == detalle:
-                        return  # Salir sin escribir
-                # Construir nueva entrada
-                usuario = self.current_user if (self.current_user.strip() and usar_usuario) else "sistema"
+                        return
+                if usuario_override is not None:
+                    usuario = usuario_override
+                else:
+                    usuario = self.current_user if (self.current_user.strip() and usar_usuario) else "sistema"
                 timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
                 entrada = {
                     "timestamp": timestamp,
@@ -161,7 +157,6 @@ class State(rx.State):
                 logs.append(entrada)
                 if len(logs) > 500:
                     logs = logs[-500:]
-                # Escribir de nuevo
                 f.seek(0)
                 f.truncate()
                 json.dump(logs, f, indent=4, ensure_ascii=False)
@@ -199,11 +194,15 @@ class State(rx.State):
 
     @rx.event
     async def on_load(self):
-        global _SSH_STARTED, _SYNC_LOOP_STARTED   # <--- AÑADIDA
-        # Cargar el último evento de puerta desde los logs
+        global _SSH_STARTED
+        self.refresh_logs()
         self._ultimo_evento_puerta = self._ultimo_log_puerta()
         self.sistema_armado = await asyncio.to_thread(get_sistema_armado)
         self.puerta_abierta = await asyncio.to_thread(get_puerta_abierta)
+        self.tamper1_abierto = await asyncio.to_thread(get_tamper1_abierto)
+        self.tamper2_abierto = await asyncio.to_thread(get_tamper2_abierto)
+        self.tamper1_armado = await asyncio.to_thread(get_tamper1_armado)
+
         self.status = "🔒 Sistema de Seguridad: ARMADO" if self.sistema_armado else "🔓 Sistema de Seguridad: DESARMADO"
 
         if not _SSH_STARTED:
@@ -212,10 +211,7 @@ class State(rx.State):
             yield State.keepalive_ssh_task
             yield State.monitor_temperatura_fan
 
-        # --- Solo lanzar el bucle de sincronización UNA VEZ ---
-        if not _SYNC_LOOP_STARTED:
-            _SYNC_LOOP_STARTED = True
-            yield State.sync_ui_loop   # o asyncio.create_task(self.sync_ui_loop())
+        yield State.sync_ui_loop
 
         mqtt_broker = os.getenv("MQTT_BROKER", "127.0.0.1")
         mqtt_port = int(os.getenv("MQTT_PORT", 1883))
@@ -245,118 +241,173 @@ class State(rx.State):
         )
 
         yield State.actualizar_estados
-        # No se lanza sync_ui_loop aquí porque ya está arriba
 
     # ════════════════════════════════════════════════════════════════════
     # ARMAR / DESARMAR
     # ════════════════════════════════════════════════════════════════════
 
     @rx.event
+    async def toggle_tamper1_armado(self, valor: bool):
+        """Arma o desarma Tamper1 independientemente."""
+        await asyncio.to_thread(set_tamper1_armado, valor)
+        self.tamper1_armado = valor
+        if not valor:
+            await asyncio.to_thread(set_notificacion_tamper1_enviada, False)
+        estado = "ARMADO" if valor else "DESARMADO"
+        self.registrar_log("TAMPER1_" + estado, f"Tamper1 {estado} (manual)", usar_usuario=False)
+
+    @rx.event
     async def conmutar_alarma(self):
         nuevo = await asyncio.to_thread(toggle_sistema_armado)
         self.sistema_armado = nuevo
         self.status = "🔒 Sistema de Seguridad: ARMADO" if nuevo else "🔓 Sistema de Seguridad: DESARMADO"
-        
-        accion = "ARMADO" if nuevo else "DESARMADO"
-        puerta_estado = "abierta" if self.puerta_abierta else "cerrada"
-        detalle = f"H.Ppal: {puerta_estado}"
-        self.registrar_log(accion, detalle, usar_usuario=True)
 
-        if nuevo and self.puerta_abierta:
-            await asyncio.to_thread(set_notificacion_enviada, True)
-            self.registrar_log(
-                "SISTEMA_ARMADO_PUERTA_ABIERTA",
-                "Sistema armado con puerta abierta - Alarma en espera",
-                usar_usuario=True
-            )
+        if nuevo:
+            abiertos = self.obtener_abiertos()
+            if abiertos:
+                lista = ", ".join(abiertos)
+                detalle = f"Armado con abiertos: {lista}"
+            else:
+                detalle = "Armado (sin abiertos)"
+            self.registrar_log("ARMADO", detalle, usar_usuario=True)
+        else:
+            self.registrar_log("DESARMADO", "", usar_usuario=True)
 
     # ════════════════════════════════════════════════════════════════════
-    # LOOP DE SINCRONIZACIÓN GENERAL (con control de duplicados)
+    # LOOP DE SINCRONIZACIÓN GENERAL
     # ════════════════════════════════════════════════════════════════════
+
+    def obtener_abiertos(self) -> list[str]:
+        abiertos = []
+        if self.puerta_abierta:
+            abiertos.append("Puerta principal")
+        if self.tamper1_abierto:
+            abiertos.append("Tamper1")
+        if self.tamper2_abierto:
+            abiertos.append("Tamper2")
+        return abiertos
+
+    @rx.var
+    def lista_abiertos(self) -> str:
+        abiertos = self.obtener_abiertos()
+        return ", ".join(abiertos) if abiertos else "Ninguno"
 
     @rx.event(background=True)
     async def sync_ui_loop(self):
         ultima_puerta = None
-        cambio_registrado = False
+        ultimo_tamper1 = None
+        ultimo_tamper2 = None
         while True:
             try:
                 real_armado = await asyncio.to_thread(get_sistema_armado)
                 real_puerta = await asyncio.to_thread(get_puerta_abierta)
+                real_tamper1 = await asyncio.to_thread(get_tamper1_abierto)
+                real_tamper2 = await asyncio.to_thread(get_tamper2_abierto)
+                real_tamper1_armado = await asyncio.to_thread(get_tamper1_armado)
 
                 async with self:
-                    if self.sistema_armado != real_armado or self.puerta_abierta != real_puerta:
+                    # Actualizar estados
+                    if (self.sistema_armado != real_armado or self.puerta_abierta != real_puerta or
+                        self.tamper1_abierto != real_tamper1 or self.tamper2_abierto != real_tamper2 or
+                        self.tamper1_armado != real_tamper1_armado):
                         self.sistema_armado = real_armado
                         self.puerta_abierta = real_puerta
+                        self.tamper1_abierto = real_tamper1
+                        self.tamper2_abierto = real_tamper2
+                        self.tamper1_armado = real_tamper1_armado
                         self.status = "🔒 Sistema de Seguridad: ARMADO" if real_armado else "🔓 Sistema de Seguridad: DESARMADO"
 
-                    # Detectar cambio de estado de la puerta
+                    # Detectar cambios en puerta principal
                     if ultima_puerta is None:
                         ultima_puerta = real_puerta
-                        cambio_registrado = False
                     elif ultima_puerta != real_puerta:
-                        if not cambio_registrado:
-                            if real_puerta and real_armado:
-                                estado_actual = "PUERTA_ABIERTA_ARMADA"
-                                estado_texto = "ABIERTA"
-                            elif real_puerta:
-                                estado_actual = "PUERTA_ABIERTA"
-                                estado_texto = "ABIERTA"
-                            else:
-                                estado_actual = "PUERTA_CERRADA"
-                                estado_texto = "CERRADA"
-
-                            ahora = time.time()
-                            if estado_actual != self._ultimo_evento_puerta and (ahora - self.last_puerta_log_time >= 1.0):
-                                detalle = f"H.Ppal → {estado_texto}"
-                                # --- LLAMADA A registrar_log (ya incluye filtro de duplicados) ---
-                                self.registrar_log(
-                                    estado_actual,
-                                    detalle,
-                                    usar_usuario=False
-                                )
-                                self._ultimo_evento_puerta = estado_actual
-                                self.last_puerta_log_time = ahora
-                                cambio_registrado = True
-                        ultima_puerta = real_puerta
-                    else:
-                        cambio_registrado = False
-
-                    # Manejar alarma (intrusión)
-                    if real_armado and real_puerta:
-                        ya_notificado = await asyncio.to_thread(get_notificacion_enviada)
-                        if not ya_notificado:
-                            await asyncio.to_thread(set_notificacion_enviada, True)
-                            print("🚨 INTRUSIÓN DETECTADA - Lanzando secuencia de alerta")
-                            self.enviar_notificacion(
-                                "🚨 ALERTA: INTRUSIÓN",
-                                "La puerta ha sido abierta con el sistema ARMADO.",
-                                "todos"
-                            )
-                            self.registrar_log(
-                                "ALARMA_DISPARADA",
-                                "Notificación enviada",
-                                usar_usuario=False
-                            )
-                    elif not real_puerta:
-                        ya_notificado = await asyncio.to_thread(get_notificacion_enviada)
-                        if ya_notificado:
+                        if real_puerta:
+                            accion = "PUERTA_ABIERTA"
+                            detalle = "ABIERTA"
+                            usuario = "puerta ppal"
+                            if real_armado:
+                                ya_notificado = await asyncio.to_thread(get_notificacion_enviada)
+                                if not ya_notificado:
+                                    await asyncio.to_thread(set_notificacion_enviada, True)
+                                    self.enviar_notificacion(
+                                        "🚨 ALERTA: INTRUSIÓN (Puerta)",
+                                        "La puerta principal se ha abierto con el sistema armado.",
+                                        "todos"
+                                    )
+                        else:
+                            accion = "PUERTA_CERRADA"
+                            detalle = "CERRADA"
+                            usuario = "puerta ppal"
                             await asyncio.to_thread(set_notificacion_enviada, False)
+                        self.registrar_log(accion, detalle, usar_usuario=False, usuario_override=usuario)
+                        ultima_puerta = real_puerta
+
+                    # Detectar cambios en Tamper1 (ABIERTO/CERRADO) - INDEPENDIENTE
+                    if ultimo_tamper1 is None:
+                        ultimo_tamper1 = real_tamper1
+                    elif ultimo_tamper1 != real_tamper1:
+                        if real_tamper1:
+                            accion = "TAMPER1_ABIERTO"
+                            detalle = "ABIERTO"
+                            usuario = "Tamper1"
+                            if real_tamper1_armado:
+                                ya_notificado_tamper1 = await asyncio.to_thread(get_notificacion_tamper1_enviada)
+                                if not ya_notificado_tamper1:
+                                    await asyncio.to_thread(set_notificacion_tamper1_enviada, True)
+                                    self.enviar_notificacion(
+                                        "🚨 ALERTA: TAMPER1",
+                                        "Tamper1 se ha abierto con su sistema armado.",
+                                        "todos"
+                                    )
+                        else:
+                            accion = "TAMPER1_CERRADO"
+                            detalle = "CERRADO"
+                            usuario = "Tamper1"
+                            await asyncio.to_thread(set_notificacion_tamper1_enviada, False)
+                        self.registrar_log(accion, detalle, usar_usuario=False, usuario_override=usuario)
+                        ultimo_tamper1 = real_tamper1
+
+                    # Detectar cambios en Tamper2 (sigue dependiendo del sistema global)
+                    if ultimo_tamper2 is None:
+                        ultimo_tamper2 = real_tamper2
+                    elif ultimo_tamper2 != real_tamper2:
+                        if real_tamper2:
+                            accion = "TAMPER2_ABIERTO"
+                            detalle = "ABIERTO"
+                            usuario = "Tamper2"
+                            if real_armado:
+                                ya_notificado = await asyncio.to_thread(get_notificacion_enviada)
+                                if not ya_notificado:
+                                    await asyncio.to_thread(set_notificacion_enviada, True)
+                                    self.enviar_notificacion(
+                                        "🚨 ALERTA: INTRUSIÓN (Tamper2)",
+                                        "Tamper2 se ha abierto con el sistema armado.",
+                                        "todos"
+                                    )
+                        else:
+                            accion = "TAMPER2_CERRADO"
+                            detalle = "CERRADO"
+                            usuario = "Tamper2"
+                            await asyncio.to_thread(set_notificacion_enviada, False)
+                        self.registrar_log(accion, detalle, usar_usuario=False, usuario_override=usuario)
+                        ultimo_tamper2 = real_tamper2
+
+                await asyncio.sleep(0.5)
 
             except Exception as e:
                 print(f"⚠️ Error en bucle de sincronización: {e}")
-
-            await asyncio.sleep(0.5)
+                await asyncio.sleep(1)
 
     # ════════════════════════════════════════════════════════════════════
     # SSH keepalive
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     @rx.event(background=True)
     async def keepalive_ssh_task(self):
         await SSHManager.keep_alive_loop()
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # Pings paralelos
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     @rx.event(background=True)
     async def actualizar_estados(self):
         hosts = [
@@ -384,9 +435,9 @@ class State(rx.State):
             self.cam_ptz_online   = ptz_r
             self.cam_fija_online  = fija_r
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # Termostato (ventilador automático, GPIO17)
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     @rx.event(background=True)
     async def monitor_temperatura_fan(self):
         while True:
@@ -404,9 +455,9 @@ class State(rx.State):
                 print(f"⚠️ Termostato: {e}")
             await asyncio.sleep(10)
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # ALERTA MANUAL
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     @rx.event
     def lanzar_alerta_global(self):
         asyncio.create_task(
@@ -420,59 +471,30 @@ class State(rx.State):
 
     @rx.event
     def lanzar_alerta_global_con_subscripcion(self, subscription_json: str):
-        """Recibe la suscripción actual del navegador y envía la alerta con el nombre del dispositivo."""
         import json
-        
-        # 1. Parsear la suscripción si existe
         sub_data = None
         if subscription_json and subscription_json != "null":
             try:
                 sub_data = json.loads(subscription_json)
             except:
                 sub_data = None
-        
-        # 2. Buscar en el archivo de suscriptores
         archivo = "suscriptores.json"
-        emisor = "Panel de Control"  # Por defecto
-        
+        emisor = "Panel de Control"
         try:
             if os.path.exists(archivo):
                 with open(archivo, "r") as f:
                     subs = json.load(f)
-                
-                # Si tenemos suscripción, buscar coincidencia
                 if sub_data and subs:
                     endpoint_buscado = sub_data.get("endpoint")
                     for s in subs:
                         if s.get("endpoint") == endpoint_buscado:
                             emisor = s.get("nombre_usuario", "Panel de Control")
                             break
-                    # Si no se encontró, guardar la nueva suscripción (asumimos que es el primer registro)
-                    else:
-                        # Guardar la nueva suscripción con el nombre (podríamos pedirlo, pero usamos el que ya tiene)
-                        # Mejor: asignar el nombre del suscriptor actual o "Desconocido"
-                        # Aquí puedes pedir el nombre al usuario o usar el que ya tiene
-                        # Si no, lo dejamos como "Panel de Control" pero lo guardamos para futuras veces
-                        # Para simplificar, lo guardamos como "Desconocido"
-                        if sub_data:
-                            # Podríamos pedir nombre aquí, pero mejor lo dejamos.
-                            sub_data["nombre_usuario"] = "Dispositivo Actual"
-                            subs.append(sub_data)
-                            with open(archivo, "w") as f:
-                                json.dump(subs, f, indent=4)
-                            # No enviamos alerta aún, pero ya está guardado.
-                            # Emisor seguirá siendo "Panel de Control" hasta que se suscriba con nombre.
-                            # Para este caso, mejor preguntar nombre al usuario, pero por ahora usamos "Panel de Control".
-                            pass
-                # Si no hay suscripción (nunca se suscribió), usar "Panel de Control"
         except Exception as e:
             print(f"Error leyendo suscriptores: {e}")
             emisor = "Panel de Control"
-        
-        # 3. Enviar la notificación
         titulo = "📢 ¡Notificación de Seguridad!"
         mensaje = f"Alerta manual activada desde **{emisor}**. Revisa las cámaras y el estado de la casa."
-        
         asyncio.create_task(
             asyncio.to_thread(
                 self.enviar_notificacion,
@@ -481,12 +503,11 @@ class State(rx.State):
                 "todos"
             )
         )
-        
         self.status = f"📢 Alerta enviada desde {emisor}"
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # PUSH
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     def enviar_notificacion(self, titulo: str, mensaje: str, destino: str = "todos"):
         from pywebpush import webpush, WebPushException
         archivo = "suscriptores.json"
@@ -569,11 +590,10 @@ class State(rx.State):
             self.status = "❌ Error al vincular"
             return rx.window_alert("Error inesperado.")
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # CÁMARAS
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
 
-    # ── URLs de los streams ──────────────────────────────────────────────
     @rx.var
     def url_fija_stream(self) -> str:
         if self.cam_mode == "pc":
@@ -588,12 +608,10 @@ class State(rx.State):
         else:
             return "https://cam.noxuscmmd.uk/api/stream.m3u8?src=ptz"
 
-    # ── Legacy (se mantiene por compatibilidad) ──────────────────────────
     @rx.var
     def url_ptz_embed(self) -> str:
         return f"http://{os.getenv('IP_RASPBERRY', '0.0.0.0')}:1984/webrtc.html?src=ptz"
 
-    # ── Control de diálogos ──────────────────────────────────────────────
     def toggle_fija_stream(self):
         self.show_fija_stream = not self.show_fija_stream
 
@@ -601,23 +619,17 @@ class State(rx.State):
         self.show_ptz_stream = not self.show_ptz_stream
 
     def toggle_cam_mode(self):
-        """Alterna entre modo PC (WebRTC) y móvil (MSE/HLS)."""
         self.cam_mode = "mobile" if self.cam_mode == "pc" else "pc"
         self.status = f"📷 Modo: {self.cam_mode.upper()}"
 
-# ── Control PTZ (con fallback a go2rtc) ────────────────────────────────
+    # ── Control PTZ ──────────────────────────────────────────────────────
+
     @rx.event(background=True)
     async def move_ptz(self, direction: str):
-        """Mueve la PTZ usando go2rtc (HTTP) o Tuya si falla."""
         import aiohttp
-        # Primero intentamos con go2rtc (más fiable y no requiere API Tuya)
         try:
             async with aiohttp.ClientSession() as s:
-                # go2rtc tiene un endpoint para PTZ: /api/ptz?move=up|down|left|right|stop
-                # Suponemos que go2rtc está en el mismo host que cam.noxuscmmd.uk o en localhost:1984
-                # Usamos la IP de la Raspberry o el dominio
                 go2rtc_url = f"http://{os.getenv('IP_RASPBERRY', '100.76.90.7')}:1984/api/ptz"
-                # Mapeo de direcciones: 0=up, 4=down, 6=left, 2=right, stop=stop
                 move_map = {"0": "up", "4": "down", "6": "left", "2": "right", "stop": "stop"}
                 move = move_map.get(direction, "stop")
                 params = {"move": move}
@@ -627,9 +639,6 @@ class State(rx.State):
                             self.cam_msg = f"✅ PTZ {move}"
                             self.status = f"✅ PTZ {move}"
                         return
-                    else:
-                        # Si falla go2rtc, intentamos con Tuya
-                        print(f"⚠️ go2rtc falló ({r.status}), intentando Tuya...")
         except Exception as e:
             print(f"⚠️ Error en go2rtc: {e}, intentando Tuya...")
 
@@ -639,7 +648,6 @@ class State(rx.State):
         t_secret = os.getenv("TUYA_ACCESS_SECRET")
         dev_id = os.getenv("ID_PTZ_TUYA")
         endpoint = "https://openapi.tuyaeu.com"
-        
         if not t_id or not t_secret or not dev_id:
             async with self:
                 self.cam_msg = "❌ Faltan credenciales Tuya"
@@ -651,10 +659,9 @@ class State(rx.State):
             cs = hashlib.sha256(body.encode()).hexdigest()
             sp = t_id + token + ts + f"{method}\n{cs}\n\n{path}"
             return hmac.new(t_secret.encode(), sp.encode(), hashlib.sha256).hexdigest().upper(), ts
-        
+
         try:
             async with aiohttp.ClientSession() as s:
-                # Obtener token
                 sg, ts = get_sign("GET", "/v1.0/token?grant_type=1")
                 async with s.get(endpoint + "/v1.0/token?grant_type=1",
                     headers={"client_id": t_id, "sign": sg, "t": ts, "sign_method": "HMAC-SHA256"},
@@ -666,8 +673,6 @@ class State(rx.State):
                             self.status = f"❌ Error token: {data.get('msg')}"
                         return
                     token = data.get("result", {}).get("access_token")
-                
-                # Enviar comando PTZ
                 cp = f"/v1.0/devices/{dev_id}/commands"
                 bm = json.dumps({"commands": [{"code": "ptz_control", "value": direction}]})
                 sm, tm = get_sign("POST", cp, token, bm)
@@ -679,7 +684,6 @@ class State(rx.State):
                         async with self:
                             self.cam_msg = f"✅ PTZ {direction}"
                             self.status = f"✅ PTZ {direction}"
-                        # Stop después de 200ms
                         await asyncio.sleep(0.2)
                         bs = json.dumps({"commands": [{"code": "ptz_stop", "value": True}]})
                         ss2, ts2 = get_sign("POST", cp, token, bs)
@@ -694,15 +698,14 @@ class State(rx.State):
                 self.cam_msg = f"❌ Error: {str(e)[:60]}"
                 self.status = f"❌ Error: {str(e)[:60]}"
 
-# ── Modo privacidad ──────────────────────────────────────────────────────
+    # ── Modo privacidad ──────────────────────────────────────────────────
+
     @rx.event(background=True)
     async def toggle_privacy(self, device_id: str, enable: bool):
-        """Activa o desactiva el modo privacidad de una cámara Tuya."""
         import aiohttp, hmac, hashlib
         t_id = os.getenv("TUYA_ACCESS_ID")
         t_secret = os.getenv("TUYA_ACCESS_SECRET")
         endpoint = "https://openapi.tuyaeu.com"
-        
         if not t_id or not t_secret or not device_id:
             async with self:
                 self.status = "❌ Faltan credenciales Tuya o ID de dispositivo"
@@ -713,10 +716,9 @@ class State(rx.State):
             cs = hashlib.sha256(body.encode()).hexdigest()
             sp = t_id + token + ts + f"{method}\n{cs}\n\n{path}"
             return hmac.new(t_secret.encode(), sp.encode(), hashlib.sha256).hexdigest().upper(), ts
-        
+
         try:
             async with aiohttp.ClientSession() as s:
-                # 1. Obtener token
                 sg, ts = get_sign("GET", "/v1.0/token?grant_type=1")
                 async with s.get(endpoint + "/v1.0/token?grant_type=1",
                     headers={"client_id": t_id, "sign": sg, "t": ts, "sign_method": "HMAC-SHA256"},
@@ -727,8 +729,6 @@ class State(rx.State):
                             self.status = f"❌ Error token: {data.get('msg')}"
                         return
                     token = data.get("result", {}).get("access_token")
-                
-                # 2. Enviar comando de privacidad (DP 105: basic_private)
                 cp = f"/v2.0/cloud/thing/{device_id}/shadow/properties/issue"
                 body = json.dumps({"basic_private": enable})
                 sm, tm = get_sign("POST", cp, token, body)
@@ -752,9 +752,10 @@ class State(rx.State):
             async with self:
                 self.status = f"❌ Error: {str(e)[:60]}"
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # ACCIONES GENÉRICAS (usan DEVICE_CONFIG y device_actions)
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
+
     @rx.event(background=True)
     async def accion_apagar(self, device_key: str):
         dev = DEVICE_CONFIG[device_key]
@@ -799,9 +800,10 @@ class State(rx.State):
     def set_custom_command(self, device_key: str, value: str):
         self.custom_command[device_key] = value
 
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
     # MÉTODOS RDP / WOL / extras
-    # ══════════════════════════════════════════════════════════════════════
+    # ════════════════════════════════════════════════════════════════════
+
     def rdp_pc(self):
         device_actions.pc_rdp()
         self.status = "▶ PC RDP"
@@ -854,7 +856,6 @@ class State(rx.State):
             (upload_dir / file.name).write_bytes(data)
         self.status = f"✅ {len(files)} archivo(s) subido(s)"
 
-    # ── Método para medir temperatura (legado) ──────────────────────────
     @rx.event(background=True)
     async def medir_temperatura(self):
         async with self: self.temperaturas = []; self.status = "🌡️ Midiendo..."
@@ -867,7 +868,6 @@ class State(rx.State):
             self.temperaturas = [f"🌡️ {t:.1f} °C" for t in resultados]
             self.status = f"🌡️ Temp: {resultados[1]:.1f} °C"
 
-    # ── Reboot Raspberry (legacy) ──────────────────────────────────────
     @rx.event(background=True)
     async def restart_raspberry(self):
         async with self: self.status = "🔄 Reiniciando Raspberry..."

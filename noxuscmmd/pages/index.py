@@ -18,13 +18,6 @@ def index_page():
         ),
         rx.center(
             rx.vstack(
-                rx.button(
-                    "Ir a Subida",
-                    on_click=rx.redirect("/upload"),
-                    style={"opacity": "0.0000001"},
-                    margin_bottom="-2em",
-                    margin_top="-5em",
-                ),
                 header_view(),
                 device_list_view(),
                 device_controls_view(),
